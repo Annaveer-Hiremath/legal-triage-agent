@@ -14,9 +14,12 @@ from src.prompts import (
     REFUSAL_EMPTY_RETRIEVAL,
     REFUSAL_NO_DOCUMENT,
     SYSTEM_PROMPT,
+    TRIAGE_EXTRACTION_PROMPT,
+    build_extraction_prompt,
     build_user_prompt,
 )
 from src.retrieval import LocalStore
+from src.triage import ClauseReport, extract_clauses
 
 DEFAULT_MODEL = os.environ.get("LEGAL_TRIAGE_MODEL", "gemma2:2b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -62,6 +65,27 @@ class GemmaTriageAgent:
     def load_path(self, path: str) -> int:
         return self.load_document(extract_file(path))
 
+    def extract_clauses_from_doc(self) -> ClauseReport | None:
+        """Run regex-based clause extraction (zero LLM cost, instant)."""
+        if self._doc is None:
+            return None
+        return extract_clauses(self._doc.text, document_name=self._doc.name)
+
+    def ask_extraction(self) -> str:
+        """
+        One-shot LLM extraction pass on the loaded document.
+        Returns raw model output (key: value lines) or an error string.
+        Falls back gracefully if Ollama is unavailable.
+        """
+        if self._doc is None:
+            return "No document loaded."
+        user_prompt = build_extraction_prompt(self._doc.text, self._doc.name)
+        try:
+            raw = self._complete_with_system(TRIAGE_EXTRACTION_PROMPT, user_prompt)
+            return raw
+        except Exception as exc:  # noqa: BLE001
+            return f"LLM extraction unavailable: {exc}"
+
     def ask(self, question: str, k: int = 6) -> TriageResult:
         if self._doc is None or self._store is None:
             return TriageResult(answer=REFUSAL_NO_DOCUMENT, warnings=["no_document"])
@@ -89,6 +113,9 @@ class GemmaTriageAgent:
         )
 
     def _complete(self, user_prompt: str) -> str:
+        return self._complete_with_system(SYSTEM_PROMPT, user_prompt)
+
+    def _complete_with_system(self, system_prompt: str, user_prompt: str) -> str:
         try:
             import ollama
         except ImportError as exc:
@@ -98,7 +125,7 @@ class GemmaTriageAgent:
         response = client.chat(
             model=self.model,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             options={
