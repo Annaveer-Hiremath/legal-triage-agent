@@ -110,8 +110,8 @@ class _ChromaIndex:
                 metadatas=[
                     {
                         "page": c.page,
-                        "start_char": c.start_char,
-                        "end_char": c.end_char,
+                        "start_line": c.start_line,
+                        "end_line": c.end_line,
                         "document_name": c.document_name,
                     }
                     for c in chunks

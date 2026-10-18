@@ -2,15 +2,22 @@
 Structured clause extraction — pure regex, no LLM, no network.
 
 Every field is explicitly marked FOUND / AMBIGUOUS / NOT_FOUND.
-Nothing is invented. Silence in the document is reported as NOT_FOUND,
-never guessed.
+Nothing is invented. Silence in the document is reported as NOT_FOUND
+("The provided document is silent on this matter."), never guessed.
+
+Every excerpt carries the exact source line range it came from
+(``Evidence.start_line`` .. ``Evidence.end_line``).
 """
 
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from enum import Enum
+
+from src.ingestion import DocLine, ExtractedDocument, format_line_ref, number_text
+from src.prompts import SILENT_PHRASE
 
 # ─────────────────────────── status enum ───────────────────────────
 
@@ -34,19 +41,48 @@ STATUS_COLOR = {
 }
 
 
-# ─────────────────────────── field result ──────────────────────────
+# ─────────────────────────── evidence + field result ───────────────────
+
+
+@dataclass
+class Evidence:
+    """One excerpt plus the exact lines it was taken from."""
+
+    text: str
+    start_line: int
+    end_line: int
+
+    @property
+    def lines(self) -> list[int]:
+        return list(range(self.start_line, self.end_line + 1))
+
+    @property
+    def ref(self) -> str:
+        return format_line_ref(self.lines)
 
 
 @dataclass
 class FieldResult:
     label: str
     status: FieldStatus
-    excerpts: list[str] = field(default_factory=list)
+    evidence: list[Evidence] = field(default_factory=list)
     note: str = ""
 
     @property
     def emoji(self) -> str:
         return STATUS_EMOJI[self.status]
+
+    @property
+    def excerpts(self) -> list[str]:  # backwards-compatible view
+        return [e.text for e in self.evidence]
+
+    @property
+    def line_numbers(self) -> list[int]:
+        return sorted({n for e in self.evidence for n in e.lines})
+
+    @property
+    def line_ref(self) -> str:
+        return format_line_ref(self.line_numbers)
 
 
 # ─────────────────────────── clause report ─────────────────────────
@@ -76,68 +112,105 @@ class ClauseReport:
             self.payment_terms,
         ]
 
+    @property
+    def found_count(self) -> int:
+        return sum(1 for f in self.all_fields() if f.status != FieldStatus.NOT_FOUND)
+
+    @property
+    def silent_count(self) -> int:
+        return sum(1 for f in self.all_fields() if f.status == FieldStatus.NOT_FOUND)
+
     def risk_summary(self) -> str:
-        """One-line plain-English risk summary, never a legal conclusion."""
-        not_found = [f.label for f in self.all_fields() if f.status == FieldStatus.NOT_FOUND]
-        ambiguous = [f.label for f in self.all_fields() if f.status == FieldStatus.AMBIGUOUS]
+        """One-line plain-English summary, never a legal conclusion."""
+        silent = [f.label for f in self.all_fields() if f.status == FieldStatus.NOT_FOUND]
+        if not silent:
+            return "Every tracked category has at least one cited passage."
+        return (
+            f"{SILENT_PHRASE} Categories with no matching lines: {', '.join(silent)}. "
+            "A qualified lawyer should review the full document."
+        )
+
+
+# ─────────────────────────── line-aware matching ───────────────────────
+
+_WINDOW = 220  # characters of context kept around each match (never beyond the cited lines)
+
+
+class _LineIndex:
+    """All document lines joined by '\\n'; maps any character offset to its line."""
+
+    def __init__(self, lines: list[DocLine]):
+        self.lines = lines
+        self.starts: list[int] = []
+        pos = 0
         parts: list[str] = []
-        if not_found:
-            parts.append(f"Clauses not found: {', '.join(not_found)}")
-        if ambiguous:
-            parts.append(f"Ambiguous clauses: {', '.join(ambiguous)}")
-        if not parts:
-            return "All tracked clause categories have at least one matching passage."
-        return " · ".join(parts) + ". A qualified lawyer should review the full document."
+        for dl in lines:
+            self.starts.append(pos)
+            parts.append(dl.text)
+            pos += len(dl.text) + 1
+        self.text = "\n".join(parts)
+
+    def index_at(self, offset: int) -> int:
+        return max(0, bisect_right(self.starts, offset) - 1)
+
+    def line_end(self, idx: int) -> int:
+        return self.starts[idx] + len(self.lines[idx].text)
 
 
-# ─────────────────────────── helpers ───────────────────────────────
-
-_WINDOW = 220  # characters of context around each match
-
-
-def _snip(text: str, match: re.Match, window: int = _WINDOW) -> str:
-    """Return a short excerpt centred on the regex match."""
-    s = max(0, match.start() - window // 2)
-    e = min(len(text), match.end() + window // 2)
-    snippet = text[s:e].replace("\n", " ").strip()
-    if s > 0:
+def _evidence(idx: _LineIndex, m: re.Match) -> Evidence:
+    """Excerpt for a regex match, cited to exactly the lines the match touches."""
+    st = m.start()
+    while st < m.end() - 1 and idx.text[st].isspace():
+        st += 1
+    en = max(m.end() - 1, st)
+    while en > st and idx.text[en].isspace():
+        en -= 1
+    i0, i1 = idx.index_at(st), idx.index_at(en)
+    block_s, block_e = idx.starts[i0], idx.line_end(i1)
+    s = max(block_s, m.start() - _WINDOW // 2)
+    e = min(block_e, m.end() + _WINDOW // 2)
+    snippet = " ".join(idx.text[s:e].split())
+    if s > block_s:
         snippet = "…" + snippet
-    if e < len(text):
+    if e < block_e:
         snippet = snippet + "…"
-    return snippet
+    return Evidence(snippet, idx.lines[i0].number, idx.lines[i1].number)
 
 
-def _find(text: str, pattern: str, flags: int = re.IGNORECASE) -> list[str]:
-    """Return up to 3 deduplicated excerpts for a pattern."""
-    seen: set[str] = set()
-    results: list[str] = []
-    for m in re.finditer(pattern, text, flags):
-        snip = _snip(text, m)
-        if snip not in seen:
-            seen.add(snip)
-            results.append(snip)
+def _find(idx: _LineIndex, pattern: str, flags: int = re.IGNORECASE) -> list[Evidence]:
+    """Up to 3 deduplicated evidence items for a pattern."""
+    seen: set[tuple[int, int, str]] = set()
+    results: list[Evidence] = []
+    for m in re.finditer(pattern, idx.text, flags):
+        ev = _evidence(idx, m)
+        key = (ev.start_line, ev.end_line, ev.text)
+        if key not in seen:
+            seen.add(key)
+            results.append(ev)
         if len(results) >= 3:
             break
     return results
 
 
-def _field(label: str, text: str, patterns: list[str]) -> FieldResult:
+def _field(label: str, idx: _LineIndex, patterns: list[str]) -> FieldResult:
     """Run multiple patterns; combine & deduplicate results."""
-    excerpts: list[str] = []
+    found: list[Evidence] = []
     for pat in patterns:
-        excerpts.extend(_find(text, pat))
-        if len(excerpts) >= 3:
+        found.extend(_find(idx, pat))
+        if len(found) >= 3:
             break
-    excerpts = list(dict.fromkeys(excerpts))[:3]  # stable dedup
+    unique: list[Evidence] = []
+    seen: set[tuple[int, int, str]] = set()
+    for ev in found:
+        key = (ev.start_line, ev.end_line, ev.text)
+        if key not in seen:
+            seen.add(key)
+            unique.append(ev)
+    unique = unique[:3]
 
-    if not excerpts:
-        return FieldResult(label=label, status=FieldStatus.NOT_FOUND)
-    if len(excerpts) == 1:
-        return FieldResult(label=label, status=FieldStatus.FOUND, excerpts=excerpts)
-    # Multiple hits could mean repeated clauses (normal) or conflicting ones
-    status = FieldStatus.FOUND
-    # Simple heuristic: if two excerpts share no words they may conflict
-    return FieldResult(label=label, status=status, excerpts=excerpts)
+    if not unique:
+        return FieldResult(label=label, status=FieldStatus.NOT_FOUND, note=SILENT_PHRASE)
+    return FieldResult(label=label, status=FieldStatus.FOUND, evidence=unique)
 
 
 # ─────────────────────────── extractors ────────────────────────────
@@ -218,15 +291,24 @@ _PAYMENT_PATTERNS = [
 
 # ─────────────────────────── public API ────────────────────────────
 
-def extract_clauses(text: str, document_name: str = "document") -> ClauseReport:
+
+def extract_clauses(source, document_name: str = "document") -> ClauseReport:
     """
-    Run regex extraction over the full document text.
-    Returns a ClauseReport. Never invents content.
-    Called offline; no network, no LLM.
+    Run regex extraction over the whole document and cite exact line numbers.
+
+    ``source`` is an ExtractedDocument (preferred - uses its line numbering) or a
+    plain string (numbered on the fly). Never invents content. Offline: no
+    network, no LLM.
     """
-    if not text or not text.strip():
-        not_found = lambda label: FieldResult(label=label, status=FieldStatus.NOT_FOUND,
-                                              note="Document text is empty.")
+    if isinstance(source, ExtractedDocument):
+        lines, document_name = source.lines, source.name
+    else:
+        lines = number_text(str(source or ""))
+
+    if not any(dl.text.strip() for dl in lines):
+        def not_found(label: str) -> FieldResult:
+            return FieldResult(label=label, status=FieldStatus.NOT_FOUND, note=SILENT_PHRASE)
+
         return ClauseReport(
             document_name=document_name,
             parties=not_found("Parties"),
@@ -239,14 +321,15 @@ def extract_clauses(text: str, document_name: str = "document") -> ClauseReport:
             payment_terms=not_found("Payment Terms"),
         )
 
+    idx = _LineIndex(lines)
     return ClauseReport(
         document_name=document_name,
-        parties=_field("Parties", text, _PARTY_PATTERNS),
-        effective_dates=_field("Effective Date / Key Dates", text, _DATE_PATTERNS),
-        notice_periods=_field("Notice Periods", text, _NOTICE_PATTERNS),
-        penalties=_field("Penalties / Damages", text, _PENALTY_PATTERNS),
-        termination=_field("Termination Conditions", text, _TERMINATION_PATTERNS),
-        jurisdiction=_field("Governing Jurisdiction", text, _JURISDICTION_PATTERNS),
-        confidentiality=_field("Confidentiality / NDA", text, _CONFIDENTIALITY_PATTERNS),
-        payment_terms=_field("Payment Terms", text, _PAYMENT_PATTERNS),
+        parties=_field("Parties", idx, _PARTY_PATTERNS),
+        effective_dates=_field("Effective Date / Key Dates", idx, _DATE_PATTERNS),
+        notice_periods=_field("Notice Periods", idx, _NOTICE_PATTERNS),
+        penalties=_field("Penalties / Damages", idx, _PENALTY_PATTERNS),
+        termination=_field("Termination Conditions", idx, _TERMINATION_PATTERNS),
+        jurisdiction=_field("Governing Jurisdiction", idx, _JURISDICTION_PATTERNS),
+        confidentiality=_field("Confidentiality / NDA", idx, _CONFIDENTIALITY_PATTERNS),
+        payment_terms=_field("Payment Terms", idx, _PAYMENT_PATTERNS),
     )
